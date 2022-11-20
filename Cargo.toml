@@ -7,3 +7,4 @@ edition = "2021"
 
 [dependencies]
 parquet-format-safe = "0.2"
+zstd = {version = "0.11", debug = true}
