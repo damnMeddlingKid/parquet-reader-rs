@@ -2,9 +2,9 @@ use parquet_format_safe::thrift::protocol::TCompactInputProtocol;
 use parquet_format_safe::{FileMetaData, PageHeader, Type};
 
 use std::{fs::File, result::Result};
-use std::io::{Read, Seek, SeekFrom, Error};
+use std::io::{Read, Seek, SeekFrom, Error, ErrorKind};
 
-const STARTING_READ_SIZE: usize = 64;
+const STARTING_READ_SIZE: usize = 1024;
 const MAGIC_NUMBER : [u8; 4] = [b'P', b'A', b'R', b'1'];
 
 fn read_footer(reader: &mut File) -> Result<FileMetaData, Box<dyn std::error::Error>> {
@@ -23,14 +23,21 @@ fn read_footer(reader: &mut File) -> Result<FileMetaData, Box<dyn std::error::Er
 
     reader.seek(SeekFrom::End(-8 -(file_metadata_size as i64)))?;
 
-    buffer.clear();
-    buffer.try_reserve((file_metadata_size as usize) - STARTING_READ_SIZE)?;
+    let metadata: &[u8];
 
-    reader.take(file_metadata_size as u64).read_to_end(&mut buffer)?;
+    if file_metadata_size as usize > buffer.capacity() {
+        // if the buffer is not big enough lets reserver more capacity
+        buffer.try_reserve((file_metadata_size as usize) - STARTING_READ_SIZE)?;
+        buffer.resize(file_metadata_size as usize, 0);
+        reader.read_exact(&mut buffer)?;
+        metadata = &buffer;
+    } else {
+        // If the buffer is too big lets take a slice of the bytes read
+        let remaining = buffer.len() - file_metadata_size as usize;
+        metadata = &buffer[remaining..]
+    }
 
-    let reader: &[u8] = &buffer;
-
-    let mut protocol = TCompactInputProtocol::new(reader, (file_metadata_size as usize)*2);
+    let mut protocol = TCompactInputProtocol::new(metadata, (file_metadata_size as usize)*2);
 
     Ok(FileMetaData::read_from_in_protocol(&mut protocol).unwrap())
 }
@@ -46,41 +53,38 @@ fn read_column(reader: &mut File, page_offset: u64, column_type: Type) -> Result
     let num_values = page_header.data_page_header.unwrap().num_values as usize;
     let compressed_size = page_header.compressed_page_size as usize;
     let uncompressed_size = page_header.uncompressed_page_size as usize;
-    let mut buffer = Vec::with_capacity(compressed_size);
+    let mut compressed_buffer = Vec::with_capacity(compressed_size);
 
     // TODO Reuse this buffer for decompressing other pages
     let mut output_buffer = vec![0u8; uncompressed_size];
 
-    let bytes_read = reader
-    .take(compressed_size as u64)
-    .read_to_end(&mut buffer).unwrap();
+    let bytes_read = match reader.take(compressed_size as u64).read_to_end(&mut compressed_buffer) {
+        Ok(bytes) => bytes,
+        Err(err) => return Err(Box::new(err)),        
+    };
 
     if bytes_read != compressed_size {
-        println!("Read was the wrong size");
+        return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Read was the wrong size")));
     }
-
-    let reader: &[u8] = &buffer;
     
-    let mut decoder = zstd::Decoder::new(reader)?;
+    let mut decoder = zstd::Decoder::new(&*compressed_buffer)?;
     decoder.read_exact(&mut output_buffer)?;
 
     match column_type {
         Type::INT64 => {
             let values_start = uncompressed_size - (num_values * 8);
-            read_plain_int64(&output_buffer[values_start..])
+            read_plain_int64(&output_buffer[values_start..])?
         }
-        _ => read_plain_int64(&output_buffer)
+        _ => return Err(Box::new(std::io::Error::new(std::io::ErrorKind::Other, "Unknown Column Encoding")))
     };
 
     Ok(())
 }
 
 fn read_plain_int64(buffer: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let mut i = 0;
-    while i + 8 <= buffer.len()  {
-        let value = u64::from_le_bytes(buffer[i..i +8].try_into()?);
+    for chunk in buffer.chunks_exact(8) {
+        let value = u64::from_le_bytes(chunk.try_into()?);
         println!("{:?}\n", value);
-        i += 8;
     }
     Ok(())
 }
@@ -90,7 +94,26 @@ fn main() {
     let mut reader = File::open(file_path).unwrap();
     let file_metadata = read_footer(&mut reader).expect("what");
     let page_offset = file_metadata.row_groups[0].columns[0].meta_data.as_ref().unwrap().data_page_offset as u64;
-    println!("{:?}", file_metadata.row_groups[0].columns[0].meta_data);
-    println!("{:?}", read_page_header(&mut reader, page_offset).expect("page header missing"));
-    read_column(&mut reader, page_offset, file_metadata.row_groups[0].columns[0].meta_data.as_ref().unwrap().type_);
+
+    let row_group = file_metadata.row_groups.get(0);
+
+    //Select the first column chunk in the group
+    let column = match row_group {
+        Some(rg) => rg.columns.get(0),
+        None => None,
+    };
+
+    //get the metadata of the column chunk
+    let meta_data = match column {
+        Some(col) => col.meta_data.as_ref(),
+        None => None,
+    };
+
+    //Read the offset of the first page of data
+    let page_offset = match meta_data {
+        Some(meta) => Ok(meta.data_page_offset as u64),
+        None => Err(Error::new(ErrorKind::InvalidData, "Page offset not found")),
+    };
+
+    read_column(&mut reader, page_offset.unwrap(), file_metadata.row_groups[0].columns[0].meta_data.as_ref().unwrap().type_);
 }
