@@ -2,7 +2,7 @@ use parquet_format_safe::thrift::protocol::TCompactInputProtocol;
 use parquet_format_safe::{FileMetaData, PageHeader, Type};
 
 use std::{fs::File, result::Result};
-use std::io::{Read, Seek, SeekFrom, Error};
+use std::io::{Read, Seek, SeekFrom, Error, ErrorKind};
 
 const STARTING_READ_SIZE: usize = 1024;
 const MAGIC_NUMBER : [u8; 4] = [b'P', b'A', b'R', b'1'];
@@ -93,8 +93,25 @@ fn main() {
     let file_path = "./test_data/tpcds_call_center/tpcds_call_center.parquet";
     let mut reader = File::open(file_path).unwrap();
     let file_metadata = read_footer(&mut reader).expect("what");
-    let page_offset = file_metadata.row_groups[0].columns[0].meta_data.as_ref().unwrap().data_page_offset as u64;
-    println!("{:?}", file_metadata.row_groups[0].columns[0].meta_data);
-    println!("{:?}", read_page_header(&mut reader, page_offset).expect("page header missing"));
-    read_column(&mut reader, page_offset, file_metadata.row_groups[0].columns[0].meta_data.as_ref().unwrap().type_);
+    let row_group = file_metadata.row_groups.get(0);
+
+    //Select the first column chunk in the group
+    let column = match row_group {
+        Some(rg) => rg.columns.get(0),
+        None => None,
+    };
+
+    //get the metadata of the column chunk
+    let meta_data = match column {
+        Some(col) => col.meta_data.as_ref(),
+        None => None,
+    };
+
+    //Read the offset of the first page of data
+    let page_offset = match meta_data {
+        Some(meta) => Ok(meta.data_page_offset as u64),
+        None => Err(Error::new(ErrorKind::InvalidData, "Page offset not found")),
+    };
+
+    read_column(&mut reader, page_offset.unwrap(), file_metadata.row_groups[0].columns[0].meta_data.as_ref().unwrap().type_);
 }
